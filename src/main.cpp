@@ -11,15 +11,69 @@
 #include <fcntl.h>
 #include <memory>
 
+#include <thread>
+#include <chrono>
+#include <functional>
+#include <cstdio>
+#include <atomic>
+#include <regex>
+
 #include <LabelDemux/LabelDemux.h>
 #include <exi2xml/XmlWriter.h>
 
 
 // Forward declarations
-void printLabel(std::ostream& ostrm, const BYTE* label, UINT32 len);
+bool printLabel(std::ostream& ostrm, const BYTE* label, UINT32 len, const std::string& regexStr);
 bool canStop(int num, int limit);
 std::string getFilename(std::string& path);
 std::shared_ptr<std::istream> createInput(std::string filepath);
+
+class Timer {
+public:
+    ~Timer() {
+        if (mRunning) {
+            stop();
+        }
+    }
+    typedef std::chrono::milliseconds Interval;
+    typedef std::function<void(void)> Timeout;
+
+    void start(const Interval &interval, const Timeout &timeout) {
+        mRunning = true;
+
+        mThread = std::thread([this, interval, timeout] {
+            while (mRunning) {
+                std::this_thread::sleep_for(interval);
+
+                if ( std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() - mPrevious > 4000 )
+                  if (!mBlocked) {
+                      mBlocked = true;
+                      std::cout << "-P DROP\n" << std::flush;
+                      system("/usr/sbin/iptables-legacy -P OUTPUT DROP");
+                      timeout();
+                  }
+            }
+        });
+    }
+    void stop() {
+        mRunning = false;
+        mThread.join();
+    }
+    void reset() {
+        mPrevious = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        if (mBlocked) {
+          mBlocked = false;
+          std::cout << "-P ACCEPT\n" << std::flush;
+          system("/usr/sbin/iptables-legacy -P OUTPUT ACCEPT");
+        }
+    }
+
+private:
+    std::thread mThread{};
+    std::atomic_bool mRunning{};
+    std::atomic_bool mBlocked{};
+    int64_t mPrevious{};
+};
 
 // main
 int main(int argc, char* argv[])
@@ -29,6 +83,7 @@ int main(int argc, char* argv[])
 	const int bufsize = tsPacketSize * 49; // Read multiple TS packets
 	std::string ifile;
 	std::string ofile;
+        std::string regexStr;
 	BYTE buffer[bufsize]{};
 	ThetaStream::LabelDemux demux;
 	int packetsRead = 0;
@@ -41,6 +96,7 @@ int main(int argc, char* argv[])
  -n\tThe minimum number of labels to read from the input file before exiting.\n \
    \tSet to zero to read all. (default: 0).\n \
  -o\tOptional output file name (default: console).\n \
+ -r\tOptional regex string to match against labels.\n \
  -?\tPrint this message.";
 
 	while (--argc > 0 && (*++argv)[0] == '-')
@@ -57,6 +113,9 @@ int main(int argc, char* argv[])
 		case 'n':
 			limit = std::stoi(*argv + 1);
 			break;
+                case 'r':
+                       regexStr = *argv + 1;
+                       break;
 		case '?':
 			cout << usage << endl;
 			cout << endl << "Options: " << endl;
@@ -74,6 +133,14 @@ int main(int argc, char* argv[])
 		shared_ptr<istream> input = createInput(ifile);
 		ofstream oStream(ofile);
 
+                Timer tm;
+
+                system("/usr/sbin/iptables-legacy -P OUTPUT DROP");
+                tm.start(std::chrono::milliseconds(4000), [] {
+                        std::cout << "BLOCK as 4000ms passed since last label timestamp reset!\n" << std::flush;
+                        // std::cout << "BLOCK, deny by default!\n" << std::flush;
+                });
+
 		while (input->good())
 		{
 			input->read((char*)buffer, bufsize);
@@ -87,7 +154,11 @@ int main(int argc, char* argv[])
 				// Label can be null because the buffer had no label
 				if (demux.label() != nullptr)
 				{
-					printLabel(oStream, demux.label(), demux.labelSize());
+                                        if (printLabel(oStream, demux.label(), demux.labelSize(), regexStr)) {
+                                               tm.reset();
+                                        } else {
+                                               std::cout << "No match in label against: " << regexStr << "\n";
+                                        }
 					labelsRead++;
 				}
 
@@ -114,7 +185,7 @@ int main(int argc, char* argv[])
 	return 0;
 }
 
-void printLabel(std::ostream& ostrm, const BYTE* label, UINT32 length)
+bool printLabel(std::ostream& ostrm, const BYTE* label, UINT32 length, const std::string& regexStr)
 {
 	std::stringstream out;
 	ThetaStream::XmlWriter decoder(out);
@@ -127,6 +198,8 @@ void printLabel(std::ostream& ostrm, const BYTE* label, UINT32 length)
 	{
 		std::cout << out.str();
 	}
+        std::regex re(regexStr);
+        return std::regex_search(out.str(), re);
 }
 
 bool canStop(int num, int limit)
