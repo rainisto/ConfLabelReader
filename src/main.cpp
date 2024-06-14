@@ -59,6 +59,9 @@ public:
         mRunning = false;
         mThread.join();
     }
+    void block() {
+        mPrevious = mPrevious - 3000;
+    }
     void reset() {
         mPrevious = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         if (mBlocked) {
@@ -157,7 +160,8 @@ int main(int argc, char* argv[])
                                         if (printLabel(oStream, demux.label(), demux.labelSize(), regexStr)) {
                                                tm.reset();
                                         } else {
-                                               std::cout << "No match in label against: " << regexStr << "\n";
+                                               std::cout << "No match in label against: " << regexStr << "\n" << std::flush;
+                                               tm.block();
                                         }
 					labelsRead++;
 				}
