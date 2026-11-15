@@ -1,6 +1,9 @@
 ﻿// ConfLabelReader.cpp : Defines the entry point for the application.
 //
 
+#include "CmdLineParser.h"
+#include "UdpOStream.h"
+#include <cstdint>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -10,170 +13,284 @@
 #endif
 #include <fcntl.h>
 #include <memory>
+#include <string.h>
 
 #include <LabelDemux/LabelDemux.h>
 #include <exi2xml/XmlWriter.h>
-
+#include <brotli/decode.h>
+#include <boost/url.hpp>
 
 // Forward declarations
-void printLabel(std::ostream& ostrm, const BYTE* label, UINT32 len);
+std::string decompressExiLabel(const BYTE* label, size_t len);
 bool canStop(int num, int limit);
-std::string getFilename(std::string& path);
+std::string getFilename(const std::string& path);
 std::shared_ptr<std::istream> createInput(std::string filepath);
+std::shared_ptr<std::ostream> createOutput(std::string filepath);
+void Banner();
+std::string decompressBrotliLabel(const uint8_t* input, size_t input_size);
+bool hasBOM(const std::string& xmlText);
+std::string preprocessXml(const char* xml);
 
 // main
 int main(int argc, char* argv[])
 {
-	using namespace std;
-	const int tsPacketSize = 188;  // MPEG-2 TS packet size
-	const int bufsize = tsPacketSize * 49; // Read multiple TS packets
-	std::string ifile;
-	std::string ofile;
-	BYTE buffer[bufsize]{};
-	ThetaStream::LabelDemux demux;
-	int packetsRead = 0;
-	int labelsRead = 0;
-	char c;
-	int limit = 0;
+    using namespace std;
+    const int tsPacketSize = 188;  // MPEG-2 TS packet size
+    const int bufsize = tsPacketSize * 49; // Read multiple TS packets
+    BYTE buffer[bufsize]{};
+    ThetaStream::LabelDemux demux;
+    int packetsRead = 0;
+    int labelsRead = 0;
 
-	const char* usage = "Usage: ConfLabelReder -i<MPEG_transport_stream_file> -n<Count> -o<Output_file>";
-	const char* opts = "  -i\tInput MPEG transport stream file path.\n \
- -n\tThe minimum number of labels to read from the input file before exiting.\n \
-   \tSet to zero to read all. (default: 0).\n \
- -o\tOptional output file name (default: console).\n \
- -?\tPrint this message.";
+    Banner();
 
-	while (--argc > 0 && (*++argv)[0] == '-')
-	{
-		c = *++argv[0];
-		switch (c)
-		{
-		case 'i':
-			ifile = *argv + 1;
-			break;
-		case 'o':
-			ofile = *argv + 1;
-			break;
-		case 'n':
-			limit = std::stoi(*argv + 1);
-			break;
-		case '?':
-			cout << usage << endl;
-			cout << endl << "Options: " << endl;
-			cout << opts << endl;
-			return 0;
-			break;
-		default:
-			cout << "ConfLabelReader: illegal option " << c << endl;
-			return -1;
-		}
-	}
+    CmdLineParser cmdline;
+    if (cmdline.parse(argc, argv) != 0)
+    {
+        return -1;
+    }
 
-	try
-	{
-		shared_ptr<istream> input = createInput(ifile);
-		ofstream oStream(ofile);
+    try
+    {
+        shared_ptr<istream> input = createInput(cmdline.input());
+        shared_ptr<ostream> output = createOutput(cmdline.output());
 
-		while (input->good())
-		{
-			input->read((char*)buffer, bufsize);
+        while (input->good())
+        {
+            input->read((char*)buffer, bufsize);
 
-			std::streamsize len = input->gcount();
-			packetsRead += (int)len / tsPacketSize;
+            std::streamsize len = input->gcount();
+            packetsRead += (int)len / tsPacketSize;
 
-			demux.parse(buffer, (UINT32)len);
-			if (demux.hasLabelStream())
-			{
-				// Label can be null because the buffer had no label
-				if (demux.label() != nullptr)
-				{
-					printLabel(oStream, demux.label(), demux.labelSize());
-					labelsRead++;
-				}
+            demux.parse(buffer, (UINT32)len);
 
-				if (canStop(labelsRead, limit))
-				{
-					break;
-				}
-			}
-			else
-			{
-				std::cout << "No label in motion imagery file, " << getFilename(ifile) << std::endl;
-				break;
-			}
-		}
-	}
-	catch (const std::exception& ex)
-	{
-		std::cout << "ERROR: " << ex.what() << endl;
-		return -1;
-	}
+            // Defined a lambda function to handle events when the LabelDemux encounters a label
+            // in the transport stream.
+            demux.setLabelCallback([&](std::string encoding, const BYTE* label, size_t len)
+                {
+                    if (len == 0 || label == 0)
+                        return;
 
-	std::cout << "Labels read: " << labelsRead << std::endl;
-	std::cout << "TS Packets read: " << packetsRead << std::endl;
-	return 0;
+                    std::string xml;
+                    if (encoding == "$EXI")
+                    {
+                        xml = decompressExiLabel(label, len);
+                    }
+                    else if (encoding == "$XML")
+                    {
+                        std::copy(label, label + len, std::back_inserter(xml));
+                    }
+                    else if (encoding == "$BRL")
+                    {
+                        xml = decompressBrotliLabel(label, len);
+                    }
+                    else
+                    {
+                        *output << "UNKNOWN" << endl;
+                    }
+
+                    if (!xml.empty())
+                    {
+                        std::string pxml = preprocessXml(xml.c_str());
+                        *output << pxml  << endl;
+                        labelsRead++;
+                    }
+                }
+            );
+
+            if (demux.hasLabelStream())
+            {
+                if (canStop(labelsRead, cmdline.number()))
+                {
+                    break;
+                }
+            }
+            else
+            {
+                std::cout << "No label in motion imagery file, " << getFilename(cmdline.input()) << std::endl;
+                break;
+            }
+        }
+    }
+    catch (const std::exception& ex)
+    {
+        std::cout << "ERROR: " << ex.what() << endl;
+        return -1;
+    }
+
+    std::cout << "Labels read: " << labelsRead << std::endl;
+    std::cout << "TS Packets read: " << packetsRead << std::endl;
+    return 0;
 }
 
-void printLabel(std::ostream& ostrm, const BYTE* label, UINT32 length)
+std::string decompressExiLabel(const BYTE* label, size_t length)
 {
-	std::stringstream out;
-	ThetaStream::XmlWriter decoder(out);
-	decoder.decode((char*)label, length);
-	if (ostrm.good())
-	{
-		ostrm << out.str();
-	}
-	else
-	{
-		std::cout << out.str();
-	}
+    ThetaStream::XmlWriter decoder;
+    const char* xmldoc = decoder.decode((char*)label, length);
+    return std::string(xmldoc);
 }
 
 bool canStop(int num, int limit)
 {
-	if (limit == 0)
-		return false;
-	return num >= limit ? true : false;
+    if (limit == 0)
+        return false;
+    return num >= limit ? true : false;
 }
 
-std::string getFilename(std::string& path)
+std::string getFilename(const std::string& path)
 {
-	std::string fname;
-	std::string::const_reverse_iterator it;
-	for (it = path.rbegin(); it != path.rend(); ++it)
-	{
-		if (*it == '\\' || *it == '/')
-			break;
-		fname.push_back(*it);
-	}
-	std::reverse(fname.begin(), fname.end());
-	return fname;
+    std::string fname;
+    std::string::const_reverse_iterator it;
+    for (it = path.rbegin(); it != path.rend(); ++it)
+    {
+        if (*it == '\\' || *it == '/')
+            break;
+        fname.push_back(*it);
+    }
+    std::reverse(fname.begin(), fname.end());
+    return fname;
 }
 
 
 std::shared_ptr<std::istream> createInput(std::string filepath)
 {
-	std::shared_ptr<std::istream> input;
-	// read file from stdin
-	if (filepath.empty())
-	{
+    std::shared_ptr<std::istream> input;
+    // read file from stdin
+    if (filepath == "-")
+    {
 #ifdef _WIN32
-		_setmode(_fileno(stdin), _O_BINARY);
+        _setmode(_fileno(stdin), _O_BINARY);
 #else
-		freopen(NULL, "rb", stdin);
+        freopen(NULL, "rb", stdin);
 #endif
-		input.reset(&std::cin, [](...) {});
-	}
-	else // read the file
-	{
-		std::ifstream* tsfile = new std::ifstream(filepath, std::ios::binary);
-		if (!tsfile->is_open())
-		{
-			std::string err("Fail to open file: ");
-			err += getFilename(filepath);
-			throw std::ios_base::failure(err);
-		}
-		input.reset(tsfile);
-	}
-	return input;
+        input.reset(&std::cin, [](...) {});
+    }
+    else // read the file
+    {
+        std::ifstream* tsfile = new std::ifstream(filepath, std::ios::binary);
+        if (!tsfile->is_open())
+        {
+            std::string err("Fail to open file: ");
+            err += getFilename(filepath);
+            throw std::ios_base::failure(err);
+        }
+        input.reset(tsfile);
+    }
+    return input;
+ }
+
+std::shared_ptr<std::ostream> createOutput(std::string filepath)
+{
+    using namespace boost;
+    namespace url = boost::urls;
+    std::string fname;
+
+    system::result<url_view> res = url::parse_uri(filepath);
+    if (!res.has_value())
+    {
+        char szErr[255]{};
+        sprintf(szErr, "Malformed URL, %s", filepath.c_str());
+        throw std::runtime_error(szErr);
+    }
+
+    url::url_view urlView = res.value();
+    if (urlView.scheme() == "file")
+    {
+#ifdef _WIN32
+        fname = urlView.encoded_path().data() + 1;
+#else
+        fname = urlView.encoded_path().data();
+#endif
+    }
+    else if (urlView.scheme() == "udp")
+    {
+        fname = filepath;
+    }
+    else
+    {
+        throw std::runtime_error("Only support file or udp scheme.");
+    }
+    std::shared_ptr<std::ostream> output;
+
+    if (fname.empty())
+    {
+        output.reset(&std::cout, [](...) {});
+    }
+    else if (urlView.scheme() == "udp")
+    {
+        UdpOStream* udpStrm = new UdpOStream(fname);
+        output.reset(udpStrm);
+    }
+    else // read the file
+    {
+        std::ofstream* tsfile = new std::ofstream(fname);
+        if (!tsfile->is_open())
+        {
+            std::string err("Fail to open file: ");
+            err += getFilename(fname);
+            throw std::ios_base::failure(err);
+        }
+        output.reset(tsfile);
+    }
+    return output;
 }
+
+void Banner()
+{
+    std::cerr << "ConfLabelReader: Confidentiality Label Reader Application v2.0.2" << std::endl;
+    std::cerr << "Copyright (c) 2026 ThetaStream Consulting, jimcavoy@thetastream.com" << std::endl << std::endl;
+}
+
+std::string decompressBrotliLabel(const uint8_t* input, size_t input_size)
+{
+    std::string label;
+    size_t output_size = input_size * 3;
+    uint8_t* output = new uint8_t[output_size];
+
+    // Decompress the data
+    BrotliDecoderResult result = BrotliDecoderDecompress(
+        input_size,          // Input size
+        input,               // Input data
+        &output_size,        // Output size (updated by the function)
+        output               // Output buffer
+    );
+
+    // Check the result
+    if (result == BROTLI_DECODER_RESULT_SUCCESS)
+    {
+        const char* str = (char*)output;
+        label.assign(str, str + output_size);
+        label.push_back(0);
+    }
+
+    delete[] output;
+    return label;
+}
+
+bool hasBOM(const std::string& xmlText)
+{
+    return xmlText[0] == (char)0xef && xmlText[1] == (char)0xbb && xmlText[2] == (char)0xbf;
+}
+
+bool hasXmlDecl(const std::string& xmlText)
+{
+    return xmlText[0] == (char)0x3c && xmlText[1] == (char)0x3f;
+}
+
+std::string preprocessXml(const char* xml)
+{
+    int offset = hasBOM(xml) ? 3 : 0;
+    std::string ret(xml+offset);
+    if (hasXmlDecl(ret))
+    {
+        return ret;
+    }
+    else
+    {
+        std::string ret2("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+        ret2 += ret;
+        return ret2;
+    }
+    return std::string();
+}
+
