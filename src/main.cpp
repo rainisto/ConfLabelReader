@@ -92,7 +92,9 @@ private:
 
     std::thread mThread{};
     std::atomic_bool mRunning{};
-    std::atomic_bool mBlocked{};
+    // Start blocked: main() sets OUTPUT DROP before the timer starts, so the
+    // first matching label must switch to ACCEPT even within the first 4000 ms.
+    std::atomic_bool mBlocked{ true };
     std::atomic<int64_t> mPrevious{};
 };
 
