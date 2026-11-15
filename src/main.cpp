@@ -15,6 +15,14 @@
 #include <memory>
 #include <string.h>
 
+#include <thread>
+#include <chrono>
+#include <functional>
+#include <cstdio>
+#include <cstdlib>
+#include <atomic>
+#include <regex>
+
 #include <LabelDemux/LabelDemux.h>
 #include <exi2xml/XmlWriter.h>
 #include <brotli/decode.h>
@@ -30,6 +38,63 @@ void Banner();
 std::string decompressBrotliLabel(const uint8_t* input, size_t input_size);
 bool hasBOM(const std::string& xmlText);
 std::string preprocessXml(const char* xml);
+
+// Watchdog: blocks outbound traffic (iptables OUTPUT DROP) when no matching
+// label has been seen for 4000 ms, and re-opens it (ACCEPT) on the next match.
+class Timer {
+public:
+    ~Timer() {
+        if (mRunning) {
+            stop();
+        }
+    }
+    typedef std::chrono::milliseconds Interval;
+    typedef std::function<void(void)> Timeout;
+
+    void start(const Interval &interval, const Timeout &timeout) {
+        mRunning = true;
+
+        mThread = std::thread([this, interval, timeout] {
+            while (mRunning) {
+                std::this_thread::sleep_for(interval);
+
+                if (now() - mPrevious > 4000)
+                    if (!mBlocked) {
+                        mBlocked = true;
+                        std::cout << "-P DROP\n" << std::flush;
+                        system("/usr/sbin/iptables-legacy -P OUTPUT DROP");
+                        timeout();
+                    }
+            }
+        });
+    }
+    void stop() {
+        mRunning = false;
+        mThread.join();
+    }
+    // Label did not match: move the deadline closer so blocking happens faster.
+    void block() {
+        mPrevious -= 3000;
+    }
+    void reset() {
+        mPrevious = now();
+        if (mBlocked) {
+            mBlocked = false;
+            std::cout << "-P ACCEPT\n" << std::flush;
+            system("/usr/sbin/iptables-legacy -P OUTPUT ACCEPT");
+        }
+    }
+
+private:
+    static int64_t now() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    std::thread mThread{};
+    std::atomic_bool mRunning{};
+    std::atomic_bool mBlocked{};
+    std::atomic<int64_t> mPrevious{};
+};
 
 // main
 int main(int argc, char* argv[])
@@ -54,6 +119,16 @@ int main(int argc, char* argv[])
     {
         shared_ptr<istream> input = createInput(cmdline.input());
         shared_ptr<ostream> output = createOutput(cmdline.output());
+        const std::string regexStr = cmdline.regex();
+        const std::regex re(regexStr);
+
+        Timer tm;
+
+        // Deny by default until the first matching label arrives.
+        system("/usr/sbin/iptables-legacy -P OUTPUT DROP");
+        tm.start(std::chrono::milliseconds(4000), [] {
+            std::cout << "BLOCK as 4000ms passed since last label timestamp reset!\n" << std::flush;
+        });
 
         while (input->good())
         {
@@ -93,6 +168,15 @@ int main(int argc, char* argv[])
                     {
                         std::string pxml = preprocessXml(xml.c_str());
                         *output << pxml  << endl;
+                        if (std::regex_search(pxml, re))
+                        {
+                            tm.reset();
+                        }
+                        else
+                        {
+                            std::cout << "No match in label against: " << regexStr << "\n" << std::flush;
+                            tm.block();
+                        }
                         labelsRead++;
                     }
                 }

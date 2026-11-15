@@ -21,6 +21,7 @@ public:
     std::string input() const;
     std::string output() const;
     int number() const;
+    std::string regex() const;
 
 private:
     class Impl;

@@ -32,6 +32,7 @@ public:
     std::string _input{ "-" };
     std::string _output{ "file://-" };
     int _number{ 0 };
+    std::string _regex;
 };
 
 const char* OTHERHELP = "";
@@ -40,6 +41,7 @@ CmdLineParser::Impl::Impl(const Impl& src)
     : _input(src._input)
     , _output(src._output)
     , _number(src._number)
+    , _regex(src._regex)
 {
 }
 
@@ -98,6 +100,7 @@ int CmdLineParser::parse(int argc, char* argv[])
             ("input,i", po::value<string>(&_pimpl->_input), "Input Motion Imagery stream or file. (default: -).")
             ("numberOfReads,n", po::value<int>(&_pimpl->_number), "The minimum number of labels to read from the input Motion Imagery stream before exiting. Set to zero to read all. (default: 0).")
             ("output,o", po::value<string>(&_pimpl->_output), "Output URL for the Motion Imagery stream. (default: file://-).")
+            ("regex,r", po::value<string>(&_pimpl->_regex), "Optional regex string to match against labels. Outbound traffic is allowed (iptables OUTPUT ACCEPT) only while matching labels keep arriving.")
             ;
 
         po::command_line_parser parser{ argc, argv };
@@ -141,4 +144,9 @@ std::string CmdLineParser::output() const
 int CmdLineParser::number() const
 {
     return _pimpl->_number;
+}
+
+std::string CmdLineParser::regex() const
+{
+    return _pimpl->_regex;
 }
