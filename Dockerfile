@@ -59,4 +59,5 @@ EXPOSE 50000/udp
 
 # Needs: docker run --cap-add NET_ADMIN ...
 # Optional label filter: append e.g. -r'<regex>' to ConfLabelReader.
+# Watchdog timeout: -w<ms> (default 3000; use 2.5-3x the label interval).
 CMD /usr/local/bin/IReflxApp -s0.0.0.0:50000 | /usr/local/bin/ConfLabelReader

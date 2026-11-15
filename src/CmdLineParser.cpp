@@ -33,6 +33,7 @@ public:
     std::string _output{ "file://-" };
     int _number{ 0 };
     std::string _regex;
+    int _watchdog{ 3000 };
 };
 
 const char* OTHERHELP = "";
@@ -42,6 +43,7 @@ CmdLineParser::Impl::Impl(const Impl& src)
     , _output(src._output)
     , _number(src._number)
     , _regex(src._regex)
+    , _watchdog(src._watchdog)
 {
 }
 
@@ -101,6 +103,7 @@ int CmdLineParser::parse(int argc, char* argv[])
             ("numberOfReads,n", po::value<int>(&_pimpl->_number), "The minimum number of labels to read from the input Motion Imagery stream before exiting. Set to zero to read all. (default: 0).")
             ("output,o", po::value<string>(&_pimpl->_output), "Output URL for the Motion Imagery stream. (default: file://-).")
             ("regex,r", po::value<string>(&_pimpl->_regex), "Optional regex string to match against labels. Outbound traffic is allowed (iptables OUTPUT ACCEPT) only while matching labels keep arriving.")
+            ("watchdog,w", po::value<int>(&_pimpl->_watchdog), "Watchdog timeout in ms: block outbound traffic when no matching label has arrived for this long. Use at least 2.5-3x the label interval. (default: 3000).")
             ;
 
         po::command_line_parser parser{ argc, argv };
@@ -114,6 +117,12 @@ int CmdLineParser::parse(int argc, char* argv[])
         if (vm.count("help"))
         {
             cerr << desc << endl;
+            return -1;
+        }
+
+        if (_pimpl->_watchdog < 500)
+        {
+            cerr << "watchdog timeout must be at least 500 ms" << endl;
             return -1;
         }
 
@@ -149,4 +158,9 @@ int CmdLineParser::number() const
 std::string CmdLineParser::regex() const
 {
     return _pimpl->_regex;
+}
+
+int CmdLineParser::watchdog() const
+{
+    return _pimpl->_watchdog;
 }

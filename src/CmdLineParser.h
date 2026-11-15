@@ -22,6 +22,7 @@ public:
     std::string output() const;
     int number() const;
     std::string regex() const;
+    int watchdog() const;
 
 private:
     class Impl;

@@ -40,7 +40,9 @@ bool hasBOM(const std::string& xmlText);
 std::string preprocessXml(const char* xml);
 
 // Watchdog: blocks outbound traffic (iptables OUTPUT DROP) when no matching
-// label has been seen for 4000 ms, and re-opens it (ACCEPT) on the next match.
+// label has been seen for the watchdog timeout (-w, default 3000 ms), and
+// re-opens it (ACCEPT) on the next match. The deadline is checked every
+// 250 ms, so blocking happens within timeout + 250 ms.
 class Timer {
 public:
     ~Timer() {
@@ -51,14 +53,15 @@ public:
     typedef std::chrono::milliseconds Interval;
     typedef std::function<void(void)> Timeout;
 
-    void start(const Interval &interval, const Timeout &timeout) {
+    void start(const Interval &checkPeriod, int64_t timeoutMs, const Timeout &timeout) {
         mRunning = true;
+        mTimeoutMs = timeoutMs;
 
-        mThread = std::thread([this, interval, timeout] {
+        mThread = std::thread([this, checkPeriod, timeout] {
             while (mRunning) {
-                std::this_thread::sleep_for(interval);
+                std::this_thread::sleep_for(checkPeriod);
 
-                if (now() - mPrevious > 4000)
+                if (now() - mPrevious > mTimeoutMs)
                     if (!mBlocked) {
                         mBlocked = true;
                         std::cout << "-P DROP\n" << std::flush;
@@ -72,9 +75,9 @@ public:
         mRunning = false;
         mThread.join();
     }
-    // Label did not match: move the deadline closer so blocking happens faster.
+    // Label did not match: expire the deadline, so the next check (within 250 ms) blocks.
     void block() {
-        mPrevious -= 3000;
+        mPrevious = now() - mTimeoutMs - 1;
     }
     void reset() {
         mPrevious = now();
@@ -93,9 +96,10 @@ private:
     std::thread mThread{};
     std::atomic_bool mRunning{};
     // Start blocked: main() sets OUTPUT DROP before the timer starts, so the
-    // first matching label must switch to ACCEPT even within the first 4000 ms.
+    // first matching label must switch to ACCEPT even within the first timeout.
     std::atomic_bool mBlocked{ true };
     std::atomic<int64_t> mPrevious{};
+    std::atomic<int64_t> mTimeoutMs{ 3000 };
 };
 
 // main
@@ -128,8 +132,9 @@ int main(int argc, char* argv[])
 
         // Deny by default until the first matching label arrives.
         system("/usr/sbin/iptables-legacy -P OUTPUT DROP");
-        tm.start(std::chrono::milliseconds(4000), [] {
-            std::cout << "BLOCK as 4000ms passed since last label timestamp reset!\n" << std::flush;
+        const int watchdogMs = cmdline.watchdog();
+        tm.start(std::chrono::milliseconds(250), watchdogMs, [watchdogMs] {
+            std::cout << "BLOCK as " << watchdogMs << "ms passed since last matching label!\n" << std::flush;
         });
 
         while (input->good())
